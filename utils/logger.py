@@ -45,8 +45,8 @@ class Logger:
         prefix = variant["save_dir"]
         return f"{prefix}/{env_name}-{variant['base_arch']}-{variant['conditioning']}-seed-{seed}"
 
-def save_model(self, path_prefix):
-    postfix = 'model'
+def save_model(self, path_prefix,postfix='model'):
+    # postfix = 'model'
     to_save = {
         "policy_state_dict": self.policy.state_dict(),
         "policy_optimizer_state_dict": self.policy_optimizer.state_dict(),

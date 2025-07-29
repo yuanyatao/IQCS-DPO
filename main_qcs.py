@@ -14,6 +14,11 @@ import swanlab as wandb
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from trainer.main_trainer import Maintrainer
 import utils
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import faiss
+from torch.utils.data import Dataset, DataLoader
+import torch
 from utils import (
     Logger,
     create_model,
@@ -23,11 +28,49 @@ from utils import (
     get_env_builder,
     load_dataset,
     initialize_q_network,
-    get_q_loss_mean
+    get_q_loss_mean,
+    discount_cumsum,
 )
 
 MAX_EPISODE_LEN = 1000
+def dpo_collate_fn(batch):
+    # batch: List[Tuple[dict, dict]]
+    def dicts_to_tensor(dicts, key):
+        return torch.stack([torch.tensor(d[key], dtype=torch.float32) for d in dicts])
+    best_chunks, worst_chunks = zip(*batch)
+    # K = best_chunks[0]['observations'].shape[0]
+    s_p = dicts_to_tensor(best_chunks, 'observations')
+    a_p = dicts_to_tensor(best_chunks, 'actions')
+    rtg_p = dicts_to_tensor(best_chunks, 'rtg')
+    # 可选，如果你有timestep/mask等字段可以补充
+    t_p = torch.zeros_like(rtg_p)  # 若没有就全0
+    m_p = torch.ones_like(rtg_p)   # 若没有就全1
+    s_d = dicts_to_tensor(worst_chunks, 'observations')
+    a_d = dicts_to_tensor(worst_chunks, 'actions')
+    rtg_d = dicts_to_tensor(worst_chunks, 'rtg')
+    t_d = torch.zeros_like(rtg_d)
+    m_d = torch.ones_like(rtg_d)
+    return (s_p, a_p, rtg_p, t_p, m_p), (s_d, a_d, rtg_d, t_d, m_d)
 
+class PreferencePairDataset(Dataset):
+    def __init__(self, pairs):
+        self.pairs = pairs
+    def __len__(self):
+        return len(self.pairs)
+    def __getitem__(self, idx):
+        # 返回best, worst两个chunk
+        return self.pairs[idx]
+    
+def _extract_chunk(traj, start_idx, K, use_rtg=True, gamma=1.0):
+    chunk = {}
+    chunk['observations'] = traj['observations'][start_idx: start_idx + K]
+    chunk['actions'] = traj['actions'][start_idx: start_idx + K]
+    chunk['rewards'] = traj['rewards'][start_idx: start_idx + K]
+    # 动态计算rtg，只在用到DPO/偏好采样时传use_rtg=True
+    if use_rtg:
+        rtg = discount_cumsum(traj["rewards"][start_idx:], gamma=gamma)[:K]
+        chunk['rtg'] = rtg
+    return chunk
 
 class Experiment:
     def __init__(self, variant):
@@ -194,6 +237,117 @@ class Experiment:
         eval_envs.close()
 
 
+    # 微观偏好数据集生成函数
+    def create_state_aligned_preference_dataset(self, 
+                                                K=8, state_threshold=0.1, reward_ratio=0.7, 
+                                                num_neighbors=50, max_pairs=10000, 
+                                                similarity_metric='l2', action_diff_threshold=0.1):
+        """
+        生成微观偏好数据集：找到轨迹中状态相似的片段对，并构建偏好数据。
+        """
+        print("Creating micro preference dataset...")
+        assert similarity_metric in ['l2', 'cosine'], "Unsupported similarity metric"
+        
+        dataset = []
+        state_library = []  # 存储轨迹信息和状态
+        state_dim = self.state_mean.shape[0]
+
+        # 1. 构建状态索引库
+        print("构建状态索引库...")
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for traj_idx, traj in enumerate(self.offline_trajs):   # <== 适配你的数据变量名
+                futures.append(executor.submit(
+                    lambda traj, idx: [(idx, t, traj['observations'][t+K-1]) for t in range(len(traj['observations']) - K)],
+                    traj, traj_idx
+                ))
+            for future in futures:
+                state_library.extend(future.result())
+
+        print(f"构建完成，共 {len(state_library)} 个状态.")
+
+        # 2. 提取归一化后的状态向量
+        state_vectors = np.array([
+            (entry[2] - self.state_mean) / self.state_std
+            for entry in state_library
+        ], dtype=np.float32)
+
+        # 3. 处理余弦相似度需要L2归一化
+        if similarity_metric == 'cosine':
+            faiss.normalize_L2(state_vectors)
+        # 4. 构建FAISS索引
+        if similarity_metric == 'l2':
+            index = faiss.IndexFlatL2(state_dim)
+        elif similarity_metric == 'cosine':
+            index = faiss.IndexFlatIP(state_dim)
+        index.add(state_vectors)
+
+        # 5. 进行最近邻搜索
+        print("开始搜索相似状态...")
+        cnt = 0
+        with tqdm(total=max_pairs, desc="开始生成偏好对") as pbar:
+            for i in range(len(state_library)):
+                traj_idx1, t1, query_state = state_library[i]
+                query_vector = np.array([(query_state - self.state_mean) / self.state_std], dtype=np.float32)
+                distances, indices = index.search(query_vector, num_neighbors)
+                candidates = [state_library[j] for j in indices[0] if j != i]
+
+                traj1 = self.offline_trajs[traj_idx1]
+                chunk1 = _extract_chunk(traj1, t1, K)
+
+                scores = []
+                for traj_idx2, t2, cand_state in candidates:
+                    if np.linalg.norm(query_state - cand_state) > state_threshold:
+                        continue
+                    traj2 = self.offline_trajs[traj_idx2]
+                    chunk2 = _extract_chunk(traj2, t2, K)
+
+                    # 确保最后一个动作不同
+                    if np.allclose(chunk1['actions'][-1], chunk2['actions'][-1], atol=action_diff_threshold):
+                        continue
+
+                    # 分数（RTG和奖励加权）
+                    score = reward_ratio * chunk2['rtg'][-1] + (1 - reward_ratio) * chunk2['rewards'][-1]
+                    scores.append((score, chunk2))
+
+                if scores:
+                    scores.sort(key=lambda x: x[0])
+                    best_chunk = scores[-1][1]
+                    worst_chunk = scores[0][1]
+                    dataset.append((best_chunk, worst_chunk))
+                    cnt += 1
+                    pbar.update(1)
+                    if cnt >= max_pairs:
+                        print(f"已经达到最大对数max_pairs: ({max_pairs}), 提前停止.")
+                        break
+        print(f"生成了 {len(dataset)} 个微观偏好对.")
+        return dataset
+
+    def create_preference_dataloader(self):
+        """
+        构建DPO用的pair数据集和DataLoader，参数从self.variant读取
+        """
+        # 全部从variant读取，主控统一
+        pairs = self.create_state_aligned_preference_dataset(
+            K=self.variant.get("dpo_K", 8),
+            state_threshold=self.variant.get("dpo_state_threshold", 0.1),
+            reward_ratio=self.variant.get("dpo_reward_ratio", 0.7),
+            num_neighbors=self.variant.get("dpo_num_neighbors", 50),
+            max_pairs=self.variant.get("dpo_max_pairs", 10000),
+            similarity_metric=self.variant.get("dpo_similarity_metric", "l2"),
+            action_diff_threshold=self.variant.get("dpo_action_diff_threshold", 0.1),
+        )
+        dataset = PreferencePairDataset(pairs)
+        batch_size = self.variant.get("dpo_batch_size", 64)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size, 
+            shuffle=True,
+            num_workers=12,
+            collate_fn=dpo_collate_fn)
+        return dataloader
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
@@ -223,13 +377,14 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", "-lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", "-wd", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=10000)
-
+   
     # pretraining options
     parser.add_argument("--max_iters", type=int, default=500)
     parser.add_argument("--num_updates_per_iter", type=int, default=1000)
 
+
     # environment options
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--log_to_wb", "-w", type=bool, default=True)
     parser.add_argument("--save_dir", type=str, default="./exp/seq")
     parser.add_argument("--exp_name", type=str, default="default")
@@ -244,7 +399,26 @@ if __name__ == "__main__":
     parser.add_argument("--iql_v_hiddens", type=int, default=2)
     
     # IDT options
-    parser.add_argument("--idt", action='store_true', help="Use IDT training")
+    parser.add_argument("--idt", action='store_true', help="Use IDT training or IDC")
+    parser.add_argument("--dycombine", action='store_true', help="Use dynamic combination of IDT and IDC")
+    parser.add_argument("--qaid", action='store_true', help="Use Q-Aid for IDT or IDC")
+    # DPO options
+    parser.add_argument("--use_dpo", action='store_true', help="Use DPO training")
+    parser.add_argument("--dpo_model_path", type=str, default="./exp/old_models/hopper-expert-v2-idt-rtg-seed-0/model.pt", help="Path to the DPO model for loading")
+    parser.add_argument("--dpo_K", type=int, default=8, help="DPO偏好片段长度")
+    parser.add_argument("--dpo_batch_size", type=int, default=64, help="DPO偏好训练batch size")
+    parser.add_argument("--dpo_state_threshold", type=float, default=0.05, help="DPO片段状态距离阈值")
+    parser.add_argument("--dpo_reward_ratio", type=float, default=0.7, help="DPO分数rtg权重")
+    parser.add_argument("--dpo_num_neighbors", type=int, default=50, help="DPO近邻数量")
+    parser.add_argument("--dpo_max_pairs", type=int, default=10000, help="DPO最大pair数")
+    parser.add_argument("--dpo_similarity_metric", type=str, default="l2", help="DPO相似度类型")
+    parser.add_argument("--dpo_action_diff_threshold", type=float, default=0.1, help="DPO末动作判定阈值")
+    parser.add_argument("--dpo_beta", type=float, default=0.5, help="DPO beta超参数")
+    
+    parser.add_argument("--save_model_name", type=str, default="dpo_model_st0_05_beta_0_5", help="DPO模型保存名称")
+    
+    
+    
     args = parser.parse_args()
 
     utils.set_seed_everywhere(args.seed)

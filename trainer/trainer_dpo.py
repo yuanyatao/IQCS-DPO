@@ -251,77 +251,62 @@ class IDT_Trainer:
         
         return loss.item(), action_loss.mean().item(), q_loss.mean().item(), weighted_q_loss.mean().item()
     
-    def train_dpo_epoch(self, preference_dataloader, reference_model, dpo_beta=1.0):
+    def train_dpo_epoch(self, preference_dataloader, reference_model_path, dpo_beta=1.0):
         """
-        DPO训练一个epoch。假设preference_dataloader每次yield (pref_chunks, dispref_chunks)，
-        每个chunk是dict，有 'observations', 'actions', 'rtg' 等字段。
+        DPO训练一个epoch
         """
+        # 1. 加载参考模型，只在第一次调用时加载
+        if not hasattr(self, "_reference_model"):
+            self._reference_model = self._load_reference_model(reference_model_path)
+        self._reference_model.eval()
+        for param in self._reference_model.parameters():
+            param.requires_grad = False
+
         total_loss = 0
         total_samples = 0
 
         self.policy.train()
-        def chunks_to_batch(chunks, device):
-            """
-            通用版本：兼容 DataLoader collate_fn 返回的 Tensor 形式和老的 List[dict] 形式
-            """
-            if isinstance(chunks, (tuple, list)):
-                # DataLoader传出的是一个tuple，每个元素是 (B, K, ...)
-                states, actions, rtgs, timesteps, masks = chunks
-                if rtgs.ndim == 2:
-                    rtgs = rtgs.unsqueeze(-1)
-                batch_size, T = states.shape[0], states.shape[1]
-                ordering = torch.arange(T, device=device).unsqueeze(0).repeat(batch_size, 1)
-                return (states.to(device), rtgs.to(device), actions.to(device),
-                        timesteps.to(device), ordering, masks.to(device))
-            elif isinstance(chunks, dict):
-                states = chunks['observations'].to(device)
-                actions = chunks['actions'].to(device)
-                rtgs = chunks['rtg'].to(device)
-                if rtgs.ndim == 2:
-                    rtgs = rtgs.unsqueeze(-1)
-                T = states.shape[1]
-                batch_size = states.shape[0]
-                timesteps = torch.arange(T, device=device).unsqueeze(0).repeat(batch_size, 1)
-                ordering = torch.arange(T, device=device).unsqueeze(0).repeat(batch_size, 1)
-                padding_mask = torch.ones((batch_size, T), dtype=torch.long, device=device)
-                return states, rtgs, actions, timesteps, ordering, padding_mask
-            else:
-                raise RuntimeError(f"Unsupported batch type: {type(chunks)}")
+        for pref_batch, dispref_batch in preference_dataloader:
+            # 保证在GPU
+            s_p, a_p, rtg_p, t_p, m_p = [x.to(self.device) for x in pref_batch]
+            s_d, a_d, rtg_d, t_d, m_d = [x.to(self.device) for x in dispref_batch]
 
-
-        for batch in preference_dataloader:
-            # 这里batch = (pref_chunks, dispref_chunks)，每个是list of dict（chunk）
-            pref_chunks, dispref_chunks = batch
-
-            # 1. 拼成batch张量
-
-            s_p, c_p, a_p, t_p, o_p, m_p = chunks_to_batch(pref_chunks,device=self.device)
-            s_d, c_d, a_d, t_d, o_d, m_d = chunks_to_batch(dispref_chunks,device=self.device)
-
-            # 2. 策略前向
-            curr_action_p = self.policy.forward(s_p, c_p, a_p, t_p, o_p, padding_mask=m_p)
-            curr_action_d = self.policy.forward(s_d, c_d, a_d, t_d, o_d, padding_mask=m_d)
+            # 当前策略
+            _, curr_action_p, _ = self.policy.forward(
+                states=s_p, actions=a_p, returns_to_go=rtg_p, timesteps=t_p, attention_mask=m_p)
+            _, curr_action_d, _ = self.policy.forward(
+                states=s_d, actions=a_d, returns_to_go=rtg_d, timesteps=t_d, attention_mask=m_d)
             curr_dist_p = torch.distributions.Normal(curr_action_p, 1.0)
             curr_dist_d = torch.distributions.Normal(curr_action_d, 1.0)
 
-            # 3. 参考策略
+            # 参考策略
             with torch.no_grad():
-                ref_action_p = reference_model.forward(s_p, c_p, a_p, t_p, o_p, padding_mask=m_p)
-                ref_action_d = reference_model.forward(s_d, c_d, a_d, t_d, o_d, padding_mask=m_d)
+                _, ref_action_p, _ = self._reference_model(
+                    states=s_p, actions=a_p, returns_to_go=rtg_p, timesteps=t_p, attention_mask=m_p)
+                _, ref_action_d, _ = self._reference_model(
+                    states=s_d, actions=a_d, returns_to_go=rtg_d, timesteps=t_d, attention_mask=m_d)
                 ref_dist_p = torch.distributions.Normal(ref_action_p, 1.0)
                 ref_dist_d = torch.distributions.Normal(ref_action_d, 1.0)
 
-            # 4. DPO损失
+            # DPO损失
             log_diff_p = (curr_dist_p.log_prob(a_p) - ref_dist_p.log_prob(a_p)).sum(-1)
             log_diff_d = (curr_dist_d.log_prob(a_d) - ref_dist_d.log_prob(a_d)).sum(-1)
             loss = -torch.log(torch.sigmoid(dpo_beta * (log_diff_p - log_diff_d))).mean()
 
+            # 优化
             self.policy_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.policy_optimizer.step()
-            self.policy_scheduler.step()
-            total_loss += loss.item() * a_p.shape[0]
-            total_samples += a_p.shape[0]
+
+            total_loss += loss.item() * len(a_p)
+            total_samples += len(a_p)
 
         avg_loss = total_loss / (total_samples + 1e-6)
         return avg_loss
+
+    def _load_reference_model(self, model_path):
+        # 假定policy有init_kwargs用于重构，或可自定义
+        reference_model = self.policy.__class__(**self.policy.init_kwargs).to(self.device)
+        checkpoint = torch.load(model_path, map_location=self.device)
+        reference_model.load_state_dict(checkpoint["model_state_dict"])
+        return reference_model    

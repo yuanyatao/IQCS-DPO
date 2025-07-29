@@ -91,7 +91,7 @@ class SequenceTrainer:
         action_target = actions.clone()
         state_mean_tensor = torch.from_numpy(self.state_mean).to(actions.device)
         state_std_tensor = torch.from_numpy(self.state_std).to(actions.device)
-        print(f"rtgs shape: {rtgs.shape}")
+        # print(f"rtgs shape: {rtgs.shape}")
         if "antmaze" in self.env_name and self.conditioning == "subgoal":
             conditions = subgoals
         else:

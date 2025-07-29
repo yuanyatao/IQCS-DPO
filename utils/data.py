@@ -241,7 +241,7 @@ def load_dataset(env_name, conditioning):
         traj_lens.append(len(path["observations"]))
         traj_return = path["rewards"].sum()
         returns.append(traj_return)
-        
+        # path["rtg_seq"] = discount_cumsum(path["rewards"], gamma=1.0) #直接全算一下RTG，便于后续使用
         #为当前轨迹的每一个时间步都赋同样的总回报（和 reward-to-go 不一样，就是全traj的 return）
         path["traj_returns"] = np.array([traj_return for i in range(len(path["rewards"]))]) 
         
